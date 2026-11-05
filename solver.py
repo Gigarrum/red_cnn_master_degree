@@ -76,7 +76,12 @@ class Solver(object):
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = lr
 
-
+    ###### CODE ADD ######
+    def normalize_(self, image, MIN_B=-1024.0, MAX_B=3072.0):
+       image = (image - MIN_B) / (MAX_B - MIN_B)
+       return image
+    ###### CODE ADD ######
+    
     def denormalize_(self, image):
         image = image * (self.norm_range_max - self.norm_range_min) + self.norm_range_min
         return image
@@ -150,6 +155,58 @@ class Solver(object):
                     np.save(os.path.join(self.save_path, 'loss_{}_iter.npy'.format(total_iters)), np.array(train_losses))
 
 
+    #######  CODE ADD #######
+    def train_with_2detect(self):
+        train_losses = []
+        total_iters = 0
+        start_time = time.time()
+        for epoch in range(1, self.num_epochs):
+            self.REDCNN.train(True)
+
+            for iter_, (target, input) in enumerate(self.data_loader):
+                total_iters += 1
+                print(total_iters)
+
+                # convert to torch tensor and add 1 channel
+                input = torch.tensor(input).unsqueeze(0).float().to(self.device)
+                target = torch.tensor(target).unsqueeze(0).float().to(self.device)
+
+                # Normalize using local min-max value.
+                # NORMALIZATION IS BEING DONE BEFORE PATCH EXTRACTION TO FOLLOW SAME PROCEDURE DONE ON COREDIFF
+                MIN_INPUT_VAL = input.min()
+                MAX_INPUT_VAL = input.max()
+                rescaled_input = self.normalize_(input, MIN_INPUT_VAL, MAX_INPUT_VAL)
+                rescaled_target = self.normalize_(target, MIN_INPUT_VAL, MAX_INPUT_VAL)
+                if self.patch_size: # patch training
+                    rescaled_input = rescaled_input.view(-1, 1, self.patch_size, self.patch_size)
+                    rescaled_target = rescaled_target.view(-1, 1, self.patch_size, self.patch_size)
+
+                pred = self.REDCNN(rescaled_input)
+                loss = self.criterion(pred, rescaled_target)
+                self.REDCNN.zero_grad()
+                self.optimizer.zero_grad()
+                
+
+                loss.backward()
+                self.optimizer.step()
+                train_losses.append(loss.item())
+
+                # print
+                if total_iters % self.print_iters == 0:
+                    print("STEP [{}], EPOCH [{}/{}], ITER [{}/{}] \nLOSS: {:.8f}, TIME: {:.1f}s".format(total_iters, epoch, 
+                                                                                                        self.num_epochs, iter_+1, 
+                                                                                                        len(self.data_loader), loss.item(), 
+                                                                                                        time.time() - start_time))
+                # learning rate decay
+                if total_iters % self.decay_iters == 0:
+                    self.lr_decay()
+                # save model
+                if total_iters % self.save_iters == 0:
+                    self.save_model(total_iters)
+                    np.save(os.path.join(self.save_path, 'loss_{}_iter.npy'.format(total_iters)), np.array(train_losses))
+    #######  CODE ADD #######
+
+    
     def test(self):
         del self.REDCNN
         # load
@@ -198,3 +255,5 @@ class Solver(object):
             print('Predictions === \nPSNR avg: {:.4f} \nSSIM avg: {:.4f} \nRMSE avg: {:.4f}'.format(pred_psnr_avg/len(self.data_loader), 
                                                                                                   pred_ssim_avg/len(self.data_loader), 
                                                                                                   pred_rmse_avg/len(self.data_loader)))
+
+
