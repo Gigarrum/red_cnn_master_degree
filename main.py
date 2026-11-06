@@ -29,6 +29,12 @@ def main(args):
             target_sample_slice_mapping=train_sample,
             return_img_paths = False
         )
+
+        val_data_loader = Reconstructed2DeteCTDataset(
+            dataset_dir_path = args.data_path,
+            target_sample_slice_mapping=val_sample,
+            return_img_paths = False
+        )
     else:
         data_loader = get_loader(mode=args.mode,
                                  load_mode=args.load_mode,
@@ -40,21 +46,21 @@ def main(args):
                                  batch_size=(args.batch_size if args.mode=='train' else 1),
                                  num_workers=args.num_workers)
     ####### CODE ADAPTED ######
-
-    solver = Solver(args, data_loader)
     if args.mode == 'train':
+        solver = Solver(args, data_loader)
         solver.train()
     ####### CODE ADD ######
     elif args.mode == 'train_with_2detect':
+        solver = Solver(args, data_loader, val_data_loader)
         solver.train_with_2detect()
     ####### CODE ADD ######
     elif args.mode == 'test':
+        solver = Solver(args, data_loader)
         solver.test()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    
     parser.add_argument('--mode', type=str, default='train') ## Possible values: train, train_with_2detect or test
     parser.add_argument('--load_mode', type=int, default=0)
     parser.add_argument('--data_path', type=str, default='./AAPM-Mayo-CT-Challenge/')
@@ -75,6 +81,9 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size', type=int, default=16)
 
     parser.add_argument('--num_epochs', type=int, default=100)
+    ####### CODE ADD ######
+    parser.add_argument('--val_every_n_epochs', type=int, default=5)
+    ####### CODE ADD ######
     parser.add_argument('--print_iters', type=int, default=20)
     parser.add_argument('--decay_iters', type=int, default=3000)
     parser.add_argument('--save_iters', type=int, default=1000)

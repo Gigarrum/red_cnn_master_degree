@@ -1,4 +1,6 @@
 import os
+import os.path as osp
+import csv
 import time
 import numpy as np
 import matplotlib
@@ -16,10 +18,15 @@ from measure import compute_measure
 
 
 class Solver(object):
-    def __init__(self, args, data_loader):
+    ####### CODE ADD: Added val_data_loader param ######
+    def __init__(self, args, data_loader, val_data_loader = None):
         self.mode = args.mode
         self.load_mode = args.load_mode
         self.data_loader = data_loader
+        ####### CODE ADD ######
+        self.val_data_loader = val_data_loader
+        ####### CODE ADD ######
+
 
         if args.device:
             self.device = torch.device(args.device)
@@ -33,6 +40,16 @@ class Solver(object):
 
         self.save_path = args.save_path
         self.multi_gpu = args.multi_gpu
+
+        ####### CODE ADD: CSV logging ######
+        os.makedirs(self.save_path, exist_ok=True)
+        os.makedirs(osp.join(self.save_path, "save_logs"), exist_ok=True)
+        os.makedirs(osp.join(self.save_path, "save_models"), exist_ok=True)
+        self.train_log_file = osp.join(self.save_path, 'save_logs', 'loss_log.csv')
+        self.validation_log_file = osp.join(self.save_path, 'save_logs', 'validation_log.csv')
+        self._initialize_csv(self.train_log_file, ['iteration', 'train_loss'])
+        self._initialize_csv(self.validation_log_file, ['iteration', 'rmse', 'psnr', 'ssim'])
+        ####### CODE ADD ######
 
         self.num_epochs = args.num_epochs
         self.print_iters = args.print_iters
@@ -55,7 +72,7 @@ class Solver(object):
 
 
     def save_model(self, iter_):
-        f = os.path.join(self.save_path, 'REDCNN_{}iter.ckpt'.format(iter_))
+        f = os.path.join(self.save_path, 'save_models', 'REDCNN_{}iter.ckpt'.format(iter_))
         torch.save(self.REDCNN.state_dict(), f)
 
 
@@ -79,6 +96,10 @@ class Solver(object):
     ###### CODE ADD ######
     def normalize_(self, image, MIN_B=-1024.0, MAX_B=3072.0):
        image = (image - MIN_B) / (MAX_B - MIN_B)
+       return image
+
+    def unnormalize_(self, image, MIN_B=-1024.0, MAX_B=3072.0):
+       image = image * (MAX_B - MIN_B) + MIN_B
        return image
     ###### CODE ADD ######
     
@@ -156,8 +177,73 @@ class Solver(object):
 
 
     #######  CODE ADD #######
+    def _initialize_csv(self, file_path, headers):
+        if not osp.exists(file_path):
+            with open(file_path, mode='w', newline='') as file:
+                writer = csv.writer(file)
+                writer.writerow(headers)
+
+    def log_train_loss(self, iteration, train_loss):
+        with open(self.train_log_file, mode='a', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow([iteration, train_loss])
+
+    def log_test_metrics(self, iteration, rmse, psnr, ssim):
+        with open(self.validation_log_file, mode='a', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow([iteration, rmse, psnr, ssim])
+
+    def validate_2detect(self):
+        """Run the model on the whole val_data_loader and return the average
+        (PSNR, SSIM, RMSE) of the predictions against the targets.
+
+        Uses the same per-image min-max normalization as train_with_2detect.
+        Metrics are computed after mapping the prediction back to the original
+        intensity scale, with data_range = (max - min) of the input image.
+        """
+        self.REDCNN.eval()
+        psnr_sum, ssim_sum, rmse_sum, n_images = 0.0, 0.0, 0.0, 0
+
+        with torch.no_grad():
+            for target, input in self.val_data_loader:
+                input = torch.as_tensor(input).float().to(self.device)
+                target = torch.as_tensor(target).float().to(self.device)
+
+                # (B, H, W) / (1, B, H, W) / ... -> (N, 1, H, W): full images, no patches
+                h, w = input.shape[-2], input.shape[-1]
+                input = input.reshape(-1, 1, h, w)
+                target = target.reshape(-1, 1, h, w)
+
+                for k in range(input.shape[0]):
+                    inp_k, tgt_k = input[k:k+1], target[k:k+1]
+
+                    MIN_INPUT_VAL = inp_k.min()
+                    MAX_INPUT_VAL = inp_k.max()
+                    pred_k = self.REDCNN(self.normalize_(inp_k, MIN_INPUT_VAL, MAX_INPUT_VAL))
+                    pred_k = self.unnormalize_(pred_k, MIN_INPUT_VAL, MAX_INPUT_VAL)
+
+                    x = inp_k.view(h, w).cpu()
+                    y = tgt_k.view(h, w).cpu()
+                    p = pred_k.view(h, w).cpu()
+                    data_range = (MAX_INPUT_VAL - MIN_INPUT_VAL).item()
+
+                    _, pred_result = compute_measure(x, y, p, data_range)
+                    psnr_sum += float(pred_result[0])
+                    ssim_sum += float(pred_result[1])
+                    rmse_sum += float(pred_result[2])
+                    n_images += 1
+                    print(f"val image {n_images}: {pred_result}")
+
+        self.REDCNN.train(True)
+        n_images = max(n_images, 1)
+        return psnr_sum / n_images, ssim_sum / n_images, rmse_sum / n_images
+
+
     def train_with_2detect(self):
         train_losses = []
+
+        do_validation = self.val_data_loader is not None
+
         total_iters = 0
         start_time = time.time()
         for epoch in range(1, self.num_epochs):
@@ -165,7 +251,6 @@ class Solver(object):
 
             for iter_, (target, input) in enumerate(self.data_loader):
                 total_iters += 1
-                print(total_iters)
 
                 # convert to torch tensor and add 1 channel
                 input = torch.tensor(input).unsqueeze(0).float().to(self.device)
@@ -190,6 +275,7 @@ class Solver(object):
                 loss.backward()
                 self.optimizer.step()
                 train_losses.append(loss.item())
+                self.log_train_loss(total_iters, loss.item())
 
                 # print
                 if total_iters % self.print_iters == 0:
@@ -203,7 +289,13 @@ class Solver(object):
                 # save model
                 if total_iters % self.save_iters == 0:
                     self.save_model(total_iters)
-                    np.save(os.path.join(self.save_path, 'loss_{}_iter.npy'.format(total_iters)), np.array(train_losses))
+                    #np.save(os.path.join(self.save_path, 'loss_{}_iter.npy'.format(total_iters)), np.array(train_losses))
+            
+            ####### CODE ADD: validation done every end of epoch ######  
+            val_psnr, val_ssim, val_rmse = self.validate_2detect()
+            print("VALIDATION @ STEP [{}] \nPSNR: {:.4f}, SSIM: {:.4f}, RMSE: {:.6f}".format(total_iters, val_psnr, val_ssim, val_rmse))
+            self.log_test_metrics(total_iters, val_rmse, val_psnr, val_ssim)
+            ####### CODE ADD ######
     #######  CODE ADD #######
 
     
@@ -255,5 +347,3 @@ class Solver(object):
             print('Predictions === \nPSNR avg: {:.4f} \nSSIM avg: {:.4f} \nRMSE avg: {:.4f}'.format(pred_psnr_avg/len(self.data_loader), 
                                                                                                   pred_ssim_avg/len(self.data_loader), 
                                                                                                   pred_rmse_avg/len(self.data_loader)))
-
-
